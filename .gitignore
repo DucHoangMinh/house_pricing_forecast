@@ -61,3 +61,5 @@ Thumbs.db
 ehthumbs.db
 
 /crawler_service/data
+
+/mongodb_data
