@@ -10,10 +10,11 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import TimeoutException, WebDriverException
+from mongo_client import MongoDBClient
 import random
 
 class RealEstateCrawler:
-    def __init__(self, base_url: str, output_dir: str):
+    def __init__(self, base_url: str, output_dir: str, use_mongo: bool = True):
         self.base_url = base_url
         self.output_dir = output_dir
         os.makedirs(self.output_dir, exist_ok=True)
@@ -26,6 +27,16 @@ class RealEstateCrawler:
         chrome_options.add_argument("--start-maximized")
         self.driver = uc.Chrome(options=chrome_options)
         self.all_listings = []  # Lưu trữ tất cả listings trước khi ghi file
+        # config mongodb client
+        self.use_mongo = use_mongo
+        if self.use_mongo:
+            self.mongo_client = MongoDBClient(
+                host="localhost",
+                port=27017,
+                username="admin",
+                password="secretpassword",
+                db_name="house_pricing_forecast"
+            )
 
     def fetch_page(self, url: str, retries: int = 2) -> BeautifulSoup:
         """Lấy nội dung HTML của một trang bằng undetected-chromedriver với retry."""
@@ -115,6 +126,10 @@ class RealEstateCrawler:
         with open(output_file, "w", encoding="utf-8") as f:
             json.dump(self.all_listings[-1000:], f, ensure_ascii=False, indent=2)
         print(f"Saved {len(self.all_listings[-1000:])} listings to {output_file}")
+    def save_to_mongo(self, listings):
+        if self.use_mongo and listings:
+            self.mongo_client.insert_listings(listings)
+            print(f"Inserted {len(listings)} listings to MongoDB")
 
     def crawl(self, max_pages: int = 3):
         """Thu thập dữ liệu từ nhiều trang và lưu khi đủ 1000 phần tử."""
@@ -130,11 +145,13 @@ class RealEstateCrawler:
             if listings:
                 self.all_listings.extend(listings)
                 print(f"Total listings collected: {len(self.all_listings)}")
-                # Lưu khi đủ 1000 phần tử
-                while len(self.all_listings) >= 1000:
-                    self.save_to_json(file_index)
-                    self.all_listings = self.all_listings[1000:]  # Giữ phần còn lại
-                    file_index += 1
+                # Lưu khi đủ 1000 phần tử (luồng cũ lưu vào json)
+                # while len(self.all_listings) >= 1000:
+                #     self.save_to_json(file_index)
+                #     self.all_listings = self.all_listings[1000:]  # Giữ phần còn lại
+                #     file_index += 1
+                self.save_to_mongo(listings)
+                print(f"Total listings collected: {len(self.all_listings)}")
             else:
                 print(f"No listings found on page {page}")
             time.sleep(random.uniform(1, 2))  # Chờ ngẫu nhiên ngắn giữa các trang
