@@ -18,16 +18,7 @@ class RealEstateCrawler:
         self.base_url = base_url
         self.output_dir = output_dir
         os.makedirs(self.output_dir, exist_ok=True)
-        # Cấu hình undetected-chromedriver
-        chrome_options = uc.ChromeOptions()
-        chrome_options.add_argument("--no-sandbox")
-        chrome_options.add_argument("--disable-dev-shm-usage")
-        chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36")
-        chrome_options.add_argument("--disable-blink-features=AutomationControlled")
-        chrome_options.add_argument("--start-maximized")
-        self.driver = uc.Chrome(options=chrome_options)
-        self.all_listings = []  # Lưu trữ tất cả listings trước khi ghi file
-        # config mongodb client
+        self.all_listings = []  # Lưu trữ listings cho JSON
         self.use_mongo = use_mongo
         if self.use_mongo:
             self.mongo_client = MongoDBClient(
@@ -38,20 +29,29 @@ class RealEstateCrawler:
                 db_name="house_pricing_forecast"
             )
 
-    def fetch_page(self, url: str, retries: int = 2) -> BeautifulSoup:
-        """Lấy nội dung HTML của một trang bằng undetected-chromedriver với retry."""
+    def _init_driver(self):
+        """Khởi tạo driver."""
+        chrome_options = uc.ChromeOptions()
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/129.0.0.0 Safari/537.36")
+        chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+        chrome_options.add_argument("--start-maximized")
+        return uc.Chrome(options=chrome_options)
+
+    def fetch_page(self, url: str, driver, retries: int = 2) -> BeautifulSoup:
+        """Lấy nội dung HTML của một trang."""
         attempt = 0
         while attempt <= retries:
             try:
                 print(f"Fetching URL: {url} (Attempt {attempt + 1}/{retries + 1})")
-                self.driver.get(url)
-                # Giả lập cuộn trang để tránh bị chặn
-                self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight/2);")
-                time.sleep(random.uniform(0.5, 1.5))  # Chờ ngẫu nhiên ngắn
-                WebDriverWait(self.driver, 10).until(
+                driver.get(url)
+                driver.execute_script("window.scrollTo(0, document.body.scrollHeight/2);")
+                time.sleep(random.uniform(0.5, 1.5))
+                WebDriverWait(driver, 10).until(
                     EC.presence_of_element_located((By.CSS_SELECTOR, "div.js__card.js__card-full-web"))
                 )
-                html = self.driver.page_source
+                html = driver.page_source
                 soup = BeautifulSoup(html, "html.parser")
                 items = soup.select("div.js__card.js__card-full-web")
                 if not items:
@@ -61,7 +61,7 @@ class RealEstateCrawler:
                 return soup
             except TimeoutException as te:
                 print(f"Timeout error fetching {url}: {te}")
-                html = self.driver.page_source
+                html = driver.page_source
                 with open(os.path.join(self.output_dir, f"timeout_page_{url.split('/')[-1]}.html"), "w", encoding="utf-8") as f:
                     f.write(html)
                 attempt += 1
@@ -71,7 +71,7 @@ class RealEstateCrawler:
                 continue
             except WebDriverException as wde:
                 print(f"WebDriver error fetching {url}: {wde}")
-                html = self.driver.page_source
+                html = driver.page_source
                 with open(os.path.join(self.output_dir, f"webdriver_error_page_{url.split('/')[-1]}.html"), "w", encoding="utf-8") as f:
                     f.write(html)
                 attempt += 1
@@ -81,7 +81,7 @@ class RealEstateCrawler:
                 continue
             except Exception as e:
                 print(f"Unexpected error fetching {url}: {e}")
-                html = self.driver.page_source
+                html = driver.page_source
                 with open(os.path.join(self.output_dir, f"error_page_{url.split('/')[-1]}.html"), "w", encoding="utf-8") as f:
                     f.write(html)
                 return None
@@ -89,7 +89,7 @@ class RealEstateCrawler:
         return None
 
     def extract_listings(self, soup: BeautifulSoup) -> List[Dict]:
-        """Trích xuất thông tin bất động sản từ một trang."""
+        """Trích xuất thông tin bất động sản, dừng nếu gặp link trùng."""
         listings = []
         items = soup.select("div.js__card.js__card-full-web")
         print(f"Found {len(items)} listing items")
@@ -114,6 +114,11 @@ class RealEstateCrawler:
                 listing["description"] = desc_elem.text.strip() if desc_elem else "N/A"
                 link_elem = item.select_one("a.js__product-link-for-product-id")
                 listing["link"] = urljoin(self.base_url, link_elem["href"]) if link_elem and link_elem.has_attr("href") else "N/A"
+                
+                # Kiểm tra link trùng trong MongoDB
+                if self.use_mongo and self.mongo_client.check_existing_link(listing["link"]):
+                    print(f"Found duplicate link: {listing['link']}. Stopping crawl.")
+                    return []  # Dừng và trả về rỗng để thoát vòng crawl
                 listings.append(listing)
             except Exception as e:
                 print(f"Error extracting listing: {e}")
@@ -126,45 +131,62 @@ class RealEstateCrawler:
         with open(output_file, "w", encoding="utf-8") as f:
             json.dump(self.all_listings[-1000:], f, ensure_ascii=False, indent=2)
         print(f"Saved {len(self.all_listings[-1000:])} listings to {output_file}")
-    def save_to_mongo(self, listings):
-        if self.use_mongo and listings:
-            self.mongo_client.insert_listings(listings)
-            print(f"Inserted {len(listings)} listings to MongoDB")
 
-    def crawl(self, max_pages: int = 3):
-        """Thu thập dữ liệu từ nhiều trang và lưu khi đủ 1000 phần tử."""
+    def save_to_mongo(self, listings):
+        """Lưu listings vào MongoDB."""
+        if self.use_mongo and listings:
+            num_inserted = self.mongo_client.insert_listings(listings)
+            print(f"Inserted {num_inserted} listings to MongoDB")
+            return num_inserted
+        return 0
+
+    def crawl_pages(self, max_pages: int, driver) -> bool:
+        """Crawl các trang và trả về True nếu có dữ liệu mới."""
+        has_new_data = False
         file_index = 1
         for page in range(1, max_pages + 1):
             page_url = f"{self.base_url}/p{page}" if page > 1 else self.base_url
             print(f"Crawling page {page}: {page_url}")
-            soup = self.fetch_page(page_url)
+            soup = self.fetch_page(page_url, driver)
             if not soup:
                 print(f"Failed to fetch page {page}")
                 continue
             listings = self.extract_listings(soup)
-            if listings:
-                self.all_listings.extend(listings)
-                print(f"Total listings collected: {len(self.all_listings)}")
-                # Lưu khi đủ 1000 phần tử (luồng cũ lưu vào json)
-                # while len(self.all_listings) >= 1000:
-                #     self.save_to_json(file_index)
-                #     self.all_listings = self.all_listings[1000:]  # Giữ phần còn lại
-                #     file_index += 1
-                self.save_to_mongo(listings)
-                print(f"Total listings collected: {len(self.all_listings)}")
-            else:
-                print(f"No listings found on page {page}")
-            time.sleep(random.uniform(1, 2))  # Chờ ngẫu nhiên ngắn giữa các trang
-        # Lưu các phần tử còn lại (nếu có)
-        if self.all_listings:
+            if not listings:  # Dừng nếu gặp link trùng hoặc không có listings
+                if page == 1 and not has_new_data:
+                    print("CRAWLER KHÔNG TÌM THẤY DỮ LIỆU MỚI")
+                break
+            self.all_listings.extend(listings)
+            num_inserted = self.save_to_mongo(listings)
+            if num_inserted > 0:
+                has_new_data = True
+            print(f"Total listings collected: {len(self.all_listings)}")
+            time.sleep(random.uniform(1, 2))
+        # Lưu các phần tử còn lại vào JSON (nếu có)
+        if not self.use_mongo and self.all_listings:
             self.save_to_json(file_index)
             print(f"Saved remaining {len(self.all_listings)} listings to batch {file_index}")
-        else:
-            print("No remaining listings to save")
+        return has_new_data
+
+    def crawl(self, max_pages: int = 9341):
+        """Crawl lặp lại mỗi 20 giây, kiểm tra dữ liệu mới."""
+        while True:
+            print(f"Starting new crawl cycle at {time.strftime('%Y-%m-%d %H:%M:%S')}")
+            driver = self._init_driver()
+            try:
+                has_new_data = self.crawl_pages(max_pages, driver)
+                if not has_new_data:
+                    print("CRAWLER KHÔNG TÌM THẤY DỮ LIỆU MỚI")
+            except Exception as e:
+                print(f"Error in crawl cycle: {e}")
+            finally:
+                driver.quit()
+            print("Waiting 20 seconds before next crawl...")
+            time.sleep(20)
 
     def __del__(self):
         """Đóng driver khi hoàn tất."""
-        self.driver.quit()
+        pass  # Driver được quản lý trong crawl
 
 if __name__ == "__main__":
     crawler = RealEstateCrawler(

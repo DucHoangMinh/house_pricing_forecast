@@ -14,5 +14,11 @@ class MongoDBClient:
         self.collection = self.db["raw_data"]
 
     def insert_listings(self, listings):
+        """Chèn danh sách listings vào MongoDB."""
         if listings:
             self.collection.insert_many(listings)
+            return len(listings)
+        return 0
+    def check_existing_link(self, link: str) -> bool:
+        """Kiểm tra xem link đã tồn tại trong collection chưa."""
+        return self.collection.find_one({"link": link}) is not None
